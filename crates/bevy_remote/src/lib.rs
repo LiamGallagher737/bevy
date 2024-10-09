@@ -307,13 +307,12 @@ use bevy_ecs::{
     component::Component,
     entity::Entity,
     reflect::ReflectComponent,
-    schedule::IntoSystemConfigs,
-    system::{Commands, In, IntoSystem, Query, ResMut, Resource, System, SystemId, SystemInput},
+    system::{Commands, In, IntoSystem, Query, Resource, System, SystemId, SystemInput},
     world::World,
 };
 use bevy_reflect::Reflect;
 use bevy_utils::{prelude::default, HashMap};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod builtin_methods;
@@ -370,23 +369,17 @@ impl Plugin for RemotePlugin {
             builtin_methods::BRP_LIST_AND_WATCH_METHOD,
             builtin_methods::process_remote_list_watching_request,
         );
-
-        app.add_systems(PreStartup, setup_mailbox_channel)
-            .add_systems(
-                Update,
-                (
-                    process_ongoing_watching_requests,
-                    remove_closed_watching_requests,
-                )
-                    .chain(),
-            );
     }
 }
 
 /// An extention trait for [`App`] providing the methods for registering remote handlers.
 pub trait RemoteAppExt {
     /// Register a new BRP handler.
-    fn register_remote_handler<I: Clone + Send + Sync + 'static, O: Send + Sync + 'static, M>(
+    fn register_remote_handler<
+        I: Clone + DeserializeOwned + Send + Sync + 'static,
+        O: Send + Sync + 'static,
+        M,
+    >(
         &mut self,
         name: impl Into<String>,
         handler: impl IntoSystem<In<Option<I>>, BrpResult<O>, M>,
@@ -394,7 +387,7 @@ pub trait RemoteAppExt {
 
     /// Register a new watching BRP handler.
     fn register_remote_watching_handler<
-        I: Clone + Send + Sync + 'static,
+        I: Clone + DeserializeOwned + Send + Sync + 'static,
         O: Send + Sync + 'static,
         M,
     >(
@@ -402,18 +395,29 @@ pub trait RemoteAppExt {
         name: impl Into<String>,
         handler: impl IntoSystem<In<Option<I>>, BrpResult<Option<O>>, M>,
     ) -> &mut Self {
+        // Reuse the above method as the only change is the return type is wrapped in an option.
         self.register_remote_handler(name, handler);
         self
     }
 }
 
 impl RemoteAppExt for App {
-    fn register_remote_handler<I: Clone + Send + Sync + 'static, O: Send + Sync + 'static, M>(
+    fn register_remote_handler<
+        I: Clone + DeserializeOwned + Send + Sync + 'static,
+        O: Send + Sync + 'static,
+        M,
+    >(
         &mut self,
         name: impl Into<String>,
         handler: impl IntoSystem<In<Option<I>>, BrpResult<O>, M>,
     ) -> &mut Self {
-        self.add_systems(Update, process_remote_requests::<I, O>);
+        self.add_systems(
+            Update,
+            (
+                process_remote_requests::<I, O>,
+                remove_closed_watching_requests::<O>,
+            ),
+        );
         let id = self
             .main_mut()
             .world_mut()
@@ -434,76 +438,6 @@ pub struct RemoteHandlerMethod(String);
 #[derive(Debug, Component, Reflect)]
 #[reflect(Component)]
 pub struct RemoteHandlerSystemId<I: SystemInput, O>(SystemId<I, O>);
-
-/// A type to hold the allowed types of systems to be used as method handlers.
-#[derive(Debug)]
-pub enum RemoteMethodHandler {
-    /// A handler that only runs once and returns one response.
-    Instant(Box<dyn System<In = In<Option<Value>>, Out = BrpResult>>),
-    /// A handler that watches for changes and response when a change is detected.
-    Watching(Box<dyn System<In = In<Option<Value>>, Out = BrpResult<Option<Value>>>>),
-}
-
-/// The [`SystemId`] of a function that implements a remote instant method (`bevy/get`, `bevy/query`, etc.)
-///
-/// The first parameter is the JSON value of the `params`. Typically, an
-/// implementation will deserialize these as the first thing they do.
-///
-/// The returned JSON value will be returned as the response. Bevy will
-/// automatically populate the `id` field before sending.
-pub type RemoteInstantMethodSystemId = SystemId<In<Option<Value>>, BrpResult>;
-
-/// The [`SystemId`] of a function that implements a remote watching method (`bevy/get+watch`, `bevy/list+watch`, etc.)
-///
-/// The first parameter is the JSON value of the `params`. Typically, an
-/// implementation will deserialize these as the first thing they do.
-///
-/// The optional returned JSON value will be sent as a response. If no
-/// changes were detected this should be [`None`]. Re-running of this
-/// handler is done in the [`RemotePlugin`].
-pub type RemoteWatchingMethodSystemId = SystemId<In<Option<Value>>, BrpResult<Option<Value>>>;
-
-/// The [`SystemId`] of a function that can be used as a remote method.
-#[derive(Debug, Clone, Copy)]
-pub enum RemoteMethodSystemId {
-    /// A handler that only runs once and returns one response.
-    Instant(RemoteInstantMethodSystemId),
-    /// A handler that watches for changes and response when a change is detected.
-    Watching(RemoteWatchingMethodSystemId),
-}
-
-/// Holds all implementations of methods known to the server.
-///
-/// Custom methods can be added to this list using [`RemoteMethods::insert`].
-#[derive(Debug, Resource, Default)]
-pub struct RemoteMethods(HashMap<String, RemoteMethodSystemId>);
-
-impl RemoteMethods {
-    /// Creates a new [`RemoteMethods`] resource with no methods registered in it.
-    pub fn new() -> Self {
-        default()
-    }
-
-    /// Adds a new method, replacing any existing method with that name.
-    ///
-    /// If there was an existing method with that name, returns its handler.
-    pub fn insert(
-        &mut self,
-        method_name: impl Into<String>,
-        handler: RemoteMethodSystemId,
-    ) -> Option<RemoteMethodSystemId> {
-        self.0.insert(method_name.into(), handler)
-    }
-
-    /// Get a [`RemoteMethodSystemId`] with its method name.
-    pub fn get(&self, method: &str) -> Option<&RemoteMethodSystemId> {
-        self.0.get(method)
-    }
-}
-
-/// Holds the [`BrpMessage`]'s of all ongoing watching requests along with their handlers.
-#[derive(Debug, Resource, Default)]
-pub struct RemoteWatchingRequests(Vec<(BrpMessage, RemoteWatchingMethodSystemId)>);
 
 /// A single request from a Bevy Remote Protocol client to the server,
 /// serialized in JSON.
@@ -720,24 +654,6 @@ pub struct BrpMessage {
     pub sender: Sender<BrpResult>,
 }
 
-/// A resource holding the matching sender for the [`BrpReceiver`]'s receiver.
-#[derive(Debug, Resource, Deref, DerefMut)]
-pub struct BrpSender(Sender<BrpMessage>);
-
-/// A resource that receives messages sent by Bevy Remote Protocol clients.
-///
-/// Every frame, the `process_remote_requests` system drains this mailbox and
-/// processes the messages within.
-#[derive(Debug, Resource, Deref, DerefMut)]
-pub struct BrpReceiver(Receiver<BrpMessage>);
-
-fn setup_mailbox_channel(mut commands: Commands) {
-    // Create the channel and the mailbox.
-    let (request_sender, request_receiver) = async_channel::bounded(CHANNEL_SIZE);
-    commands.insert_resource(BrpSender(request_sender));
-    commands.insert_resource(BrpReceiver(request_receiver));
-}
-
 /// The data for a BRP request.
 #[derive(Debug, Component)]
 pub struct RemoteRequest<O> {
@@ -750,27 +666,102 @@ pub struct RemoteRequest<O> {
 /// The params of a BRP request.
 ///
 /// If no params were supplied this component should be ommited.
-#[derive(Debug, Component)]
-pub struct RemoteRequestParams<T>(T);
+#[derive(Debug, Component, Reflect)]
+#[reflect(Component)]
+pub enum RemoteRequestParams<T: DeserializeOwned> {
+    /// A request's parameters serialized as a [`serde_json::Value`].
+    Serialized(#[reflect(ignore)] Value),
+    /// A request's parameters in their Rust type form.
+    Deserialized(T),
+}
 
-fn process_remote_requests<I: Clone + Send + Sync + 'static, O: Send + 'static>(
+impl<T: DeserializeOwned> RemoteRequestParams<T> {
+    /// Check if the parameters are in their serialized form.
+    #[must_use]
+    pub fn is_serialized(&self) -> bool {
+        match self {
+            RemoteRequestParams::Serialized(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Check if the parameters are in their deserialized form.
+    #[must_use]
+    pub fn is_deserialized(&self) -> bool {
+        match self {
+            RemoteRequestParams::Deserialized(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Deserialize the parameters. Does nothing if they are already deserialized.
+    #[must_use]
+    pub fn deserialize(&mut self) -> BrpResult<()> {
+        match self {
+            RemoteRequestParams::Serialized(value) => {
+                let value = std::mem::take(value);
+                let deserialized = serde_json::from_value(value).map_err(|err| BrpError {
+                    code: error_codes::PARSE_ERROR,
+                    message: err.to_string(),
+                    data: None,
+                })?;
+                *self = RemoteRequestParams::Deserialized(deserialized);
+            }
+            _ => {}
+        };
+        Ok(())
+    }
+}
+
+fn process_remote_requests<
+    I: Clone + DeserializeOwned + Send + Sync + 'static,
+    O: Send + 'static,
+>(
     mut commands: Commands,
-    request_query: Query<(&RemoteRequest<O>, Option<&RemoteRequestParams<I>>)>,
+    mut request_query: Query<(&RemoteRequest<O>, Option<&mut RemoteRequestParams<I>>)>,
     handler_query: Query<(
         &RemoteHandlerMethod,
         &RemoteHandlerSystemId<In<Option<I>>, BrpResult<O>>,
     )>,
 ) {
-    for (request, params) in &request_query {
+    for (request, mut params) in &mut request_query {
+        if request.sender.is_closed() {
+            continue;
+        }
+
+        // Get the handler with it's method.
         let Some(handler) = handler_query
             .iter()
             .find(|(method, _)| method.0 == request.method)
             .map(|(_, handler)| handler.0.clone())
         else {
+            request.sender.force_send(Err(BrpError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: format!("Method `{}` not found", request.method),
+                data: None,
+            }));
+            request.sender.close();
             continue;
         };
+
+        // Deserialize the params if they are present and not already deserialized.
+        if let Some(params) = params.as_mut() {
+            if params.is_serialized() {
+                if let Err(err) = params.deserialize() {
+                    let _ = request.sender.force_send(Err(err));
+                    // No point keeping channel open if the params are bad.
+                    request.sender.close();
+                    continue;
+                }
+            }
+        };
+
         let sender = request.sender.clone();
-        let input = params.map(|b| b.0.to_owned());
+        let input = params.map(|value| match value.as_ref() {
+            RemoteRequestParams::Deserialized(value) => value.to_owned(),
+            RemoteRequestParams::Serialized(_) => unreachable!(),
+        });
+
         commands.queue(move |world: &mut World| {
             let result = match world.run_system_with_input(handler, input) {
                 Ok(result) => result,
@@ -781,10 +772,13 @@ fn process_remote_requests<I: Clone + Send + Sync + 'static, O: Send + 'static>(
                 }),
             };
             let _ = sender.force_send(result);
+            // No point keeping channel open if method is bad.
+            sender.close();
         });
     }
 }
 
+/// A system to remove requests with closed channels
 fn remove_closed_watching_requests<O: Send + 'static>(
     mut commands: Commands,
     query: Query<(Entity, &RemoteRequest<O>)>,
