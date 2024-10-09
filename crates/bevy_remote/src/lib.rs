@@ -300,25 +300,23 @@
 //! [fully-qualified type names]: bevy_reflect::TypePath::type_path
 //! [fully-qualified type name]: bevy_reflect::TypePath::type_path
 
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use bevy_app::prelude::*;
-use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
     component::Component,
     entity::Entity,
+    query::Has,
     reflect::ReflectComponent,
-    system::{Commands, In, IntoSystem, Query, Resource, System, SystemId, SystemInput},
+    schedule::{IntoSystemConfigs, IntoSystemSetConfigs, SystemSet},
+    system::{Commands, In, IntoSystem, Query, SystemId, SystemInput},
     world::World,
 };
 use bevy_reflect::Reflect;
-use bevy_utils::{prelude::default, HashMap};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod builtin_methods;
 pub mod http;
-
-const CHANNEL_SIZE: usize = 16;
 
 /// Add this plugin to your [`App`] to allow remote connections to inspect and modify entities.
 ///
@@ -369,7 +367,30 @@ impl Plugin for RemotePlugin {
             builtin_methods::BRP_LIST_AND_WATCH_METHOD,
             builtin_methods::process_remote_list_watching_request,
         );
+
+        app.configure_sets(
+            Update,
+            (
+                BrpSystemSet::Deserialize,
+                BrpSystemSet::Process,
+                BrpSystemSet::Cleanup,
+            )
+                .chain(),
+        );
+
+        app.add_systems(Update, remove_closed_requests.in_set(BrpSystemSet::Cleanup));
     }
+}
+
+/// A system set for the order of BRP request processing.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BrpSystemSet {
+    /// The deserialization stage.
+    Deserialize,
+    /// The processing stage where handlers are run.
+    Process,
+    /// The cleanup stage where closed requests are despawned.
+    Cleanup,
 }
 
 /// An extention trait for [`App`] providing the methods for registering remote handlers.
@@ -377,7 +398,7 @@ pub trait RemoteAppExt {
     /// Register a new BRP handler.
     fn register_remote_handler<
         I: Clone + DeserializeOwned + Send + Sync + 'static,
-        O: Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
         M,
     >(
         &mut self,
@@ -388,34 +409,31 @@ pub trait RemoteAppExt {
     /// Register a new watching BRP handler.
     fn register_remote_watching_handler<
         I: Clone + DeserializeOwned + Send + Sync + 'static,
-        O: Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
         M,
     >(
         &mut self,
         name: impl Into<String>,
         handler: impl IntoSystem<In<Option<I>>, BrpResult<Option<O>>, M>,
-    ) -> &mut Self {
-        // Reuse the above method as the only change is the return type is wrapped in an option.
-        self.register_remote_handler(name, handler);
-        self
-    }
+    ) -> &mut Self;
 }
 
 impl RemoteAppExt for App {
     fn register_remote_handler<
         I: Clone + DeserializeOwned + Send + Sync + 'static,
-        O: Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
         M,
     >(
         &mut self,
         name: impl Into<String>,
         handler: impl IntoSystem<In<Option<I>>, BrpResult<O>, M>,
     ) -> &mut Self {
+        let name = name.into();
         self.add_systems(
             Update,
             (
-                process_remote_requests::<I, O>,
-                remove_closed_watching_requests::<O>,
+                deserialize_request_params::<I>(name.clone()).in_set(BrpSystemSet::Deserialize),
+                process_remote_requests::<I, O>.in_set(BrpSystemSet::Process),
             ),
         );
         let id = self
@@ -424,7 +442,36 @@ impl RemoteAppExt for App {
             .register_boxed_system(Box::new(IntoSystem::into_system(handler)));
         self.main_mut()
             .world_mut()
-            .spawn((RemoteHandlerMethod(name.into()), RemoteHandlerSystemId(id)));
+            .spawn((RemoteHandlerMethod(name), RemoteHandlerSystemId(id)));
+        self
+    }
+
+    fn register_remote_watching_handler<
+        I: Clone + DeserializeOwned + Send + Sync + 'static,
+        O: Serialize + Send + Sync + 'static,
+        M,
+    >(
+        &mut self,
+        name: impl Into<String>,
+        handler: impl IntoSystem<In<Option<I>>, BrpResult<Option<O>>, M>,
+    ) -> &mut Self {
+        let name = name.into();
+        self.add_systems(
+            Update,
+            (
+                deserialize_request_params::<I>(name.clone()).in_set(BrpSystemSet::Deserialize),
+                process_remote_requests::<I, Option<O>>.in_set(BrpSystemSet::Process),
+            ),
+        );
+        let id = self
+            .main_mut()
+            .world_mut()
+            .register_boxed_system(Box::new(IntoSystem::into_system(handler)));
+        self.main_mut().world_mut().spawn((
+            RemoteHandlerMethod(name),
+            RemoteHandlerSystemId(id),
+            RemoteWatchingHandler,
+        ));
         self
     }
 }
@@ -438,6 +485,11 @@ pub struct RemoteHandlerMethod(String);
 #[derive(Debug, Component, Reflect)]
 #[reflect(Component)]
 pub struct RemoteHandlerSystemId<I: SystemInput, O>(SystemId<I, O>);
+
+/// A marker component for a handler that is for watching requests.
+#[derive(Debug, Component, Reflect)]
+#[reflect(Component)]
+pub struct RemoteWatchingHandler;
 
 /// A single request from a Bevy Remote Protocol client to the server,
 /// serialized in JSON.
@@ -656,75 +708,74 @@ pub struct BrpMessage {
 
 /// The data for a BRP request.
 #[derive(Debug, Component)]
-pub struct RemoteRequest<O> {
+pub struct RemoteRequest {
     /// The method to invoked by this request.
     pub method: String,
     /// The sender for this request's channel.
-    pub sender: Sender<BrpResult<O>>,
+    pub sender: Sender<BrpResult<Value>>,
 }
 
-/// The params of a BRP request.
-///
-/// If no params were supplied this component should be ommited.
+/// A BRP request's params as their strict Rust type.
+#[derive(Debug, Component)]
+pub struct RequestParams<T>(T);
+
+/// A BRP request's params as a [`serde_json::Value`].
+#[derive(Debug, Component)]
+pub struct SerializedRequestParams(Value);
+
+/// A marker component for a watching BRP request.
 #[derive(Debug, Component, Reflect)]
 #[reflect(Component)]
-pub enum RemoteRequestParams<T: DeserializeOwned> {
-    /// A request's parameters serialized as a [`serde_json::Value`].
-    Serialized(#[reflect(ignore)] Value),
-    /// A request's parameters in their Rust type form.
-    Deserialized(T),
-}
+pub struct WatchingRequest;
 
-impl<T: DeserializeOwned> RemoteRequestParams<T> {
-    /// Check if the parameters are in their serialized form.
-    #[must_use]
-    pub fn is_serialized(&self) -> bool {
-        match self {
-            RemoteRequestParams::Serialized(_) => true,
-            _ => false,
-        }
-    }
-
-    /// Check if the parameters are in their deserialized form.
-    #[must_use]
-    pub fn is_deserialized(&self) -> bool {
-        match self {
-            RemoteRequestParams::Deserialized(_) => true,
-            _ => false,
-        }
-    }
-
-    /// Deserialize the parameters. Does nothing if they are already deserialized.
-    #[must_use]
-    pub fn deserialize(&mut self) -> BrpResult<()> {
-        match self {
-            RemoteRequestParams::Serialized(value) => {
-                let value = std::mem::take(value);
-                let deserialized = serde_json::from_value(value).map_err(|err| BrpError {
-                    code: error_codes::PARSE_ERROR,
-                    message: err.to_string(),
-                    data: None,
-                })?;
-                *self = RemoteRequestParams::Deserialized(deserialized);
+/// Returns a new system that deserializes all request's [`SerializedRequestParams`] with
+/// the given method name into the given generic type. This value is added to the entity
+/// in [`RequestParams`].
+fn deserialize_request_params<T: DeserializeOwned + Send + Sync + 'static>(
+    method: String,
+) -> impl Fn(Commands, Query<(Entity, &RemoteRequest, &mut SerializedRequestParams)>) {
+    move |mut commands: Commands,
+          mut query: Query<(Entity, &RemoteRequest, &mut SerializedRequestParams)>| {
+        for (entity, request, mut params) in &mut query {
+            if request.method != method {
+                continue;
             }
-            _ => {}
-        };
-        Ok(())
+
+            match serde_json::from_value::<T>(core::mem::take(&mut params.0)) {
+                Ok(value) => {
+                    commands.entity(entity).remove::<SerializedRequestParams>();
+                    commands.entity(entity).insert(RequestParams(value));
+                }
+                Err(err) => {
+                    let _ = request.sender.force_send(Err(BrpError {
+                        code: error_codes::PARSE_ERROR,
+                        message: err.to_string(),
+                        data: None,
+                    }));
+                    request.sender.close();
+                }
+            }
+        }
     }
 }
 
 fn process_remote_requests<
     I: Clone + DeserializeOwned + Send + Sync + 'static,
-    O: Send + 'static,
+    O: Serialize + Send + 'static,
 >(
     mut commands: Commands,
-    mut request_query: Query<(&RemoteRequest<O>, Option<&mut RemoteRequestParams<I>>)>,
+    request_query: Query<(
+        &RemoteRequest,
+        Option<&RequestParams<I>>,
+        Has<WatchingRequest>,
+    )>,
     handler_query: Query<(
         &RemoteHandlerMethod,
         &RemoteHandlerSystemId<In<Option<I>>, BrpResult<O>>,
+        Has<RemoteWatchingHandler>,
     )>,
 ) {
-    for (request, mut params) in &mut request_query {
+    for (request, params, is_watching) in &request_query {
         if request.sender.is_closed() {
             continue;
         }
@@ -732,10 +783,10 @@ fn process_remote_requests<
         // Get the handler with it's method.
         let Some(handler) = handler_query
             .iter()
-            .find(|(method, _)| method.0 == request.method)
-            .map(|(_, handler)| handler.0.clone())
+            .find(|(method, _, _)| method.0 == request.method)
+            .map(|(_, handler, _)| handler.0)
         else {
-            request.sender.force_send(Err(BrpError {
+            let _ = request.sender.force_send(Err(BrpError {
                 code: error_codes::METHOD_NOT_FOUND,
                 message: format!("Method `{}` not found", request.method),
                 data: None,
@@ -744,23 +795,8 @@ fn process_remote_requests<
             continue;
         };
 
-        // Deserialize the params if they are present and not already deserialized.
-        if let Some(params) = params.as_mut() {
-            if params.is_serialized() {
-                if let Err(err) = params.deserialize() {
-                    let _ = request.sender.force_send(Err(err));
-                    // No point keeping channel open if the params are bad.
-                    request.sender.close();
-                    continue;
-                }
-            }
-        };
-
         let sender = request.sender.clone();
-        let input = params.map(|value| match value.as_ref() {
-            RemoteRequestParams::Deserialized(value) => value.to_owned(),
-            RemoteRequestParams::Serialized(_) => unreachable!(),
-        });
+        let input = params.map(|v| v.0.clone());
 
         commands.queue(move |world: &mut World| {
             let result = match world.run_system_with_input(handler, input) {
@@ -771,18 +807,22 @@ fn process_remote_requests<
                     data: None,
                 }),
             };
+            let result = match result {
+                Ok(val) => serde_json::to_value(val).map_err(BrpError::internal),
+                Err(err) => Err(err),
+            };
+            let err = result.is_err();
             let _ = sender.force_send(result);
-            // No point keeping channel open if method is bad.
-            sender.close();
+            if err || is_watching {
+                // No point keeping channel open if method is bad.
+                sender.close();
+            }
         });
     }
 }
 
 /// A system to remove requests with closed channels
-fn remove_closed_watching_requests<O: Send + 'static>(
-    mut commands: Commands,
-    query: Query<(Entity, &RemoteRequest<O>)>,
-) {
+fn remove_closed_requests(mut commands: Commands, query: Query<(Entity, &RemoteRequest)>) {
     for (entity, request) in &query {
         if request.sender.is_closed() {
             commands.entity(entity).despawn();

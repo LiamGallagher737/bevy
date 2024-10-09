@@ -9,13 +9,15 @@
 #![cfg(not(target_family = "wasm"))]
 
 use crate::{
-    error_codes, BrpBatch, BrpError, BrpMessage, BrpRequest, BrpResponse, BrpResult, BrpSender,
+    error_codes, BrpBatch, BrpError, BrpMessage, BrpRequest, BrpResponse, BrpResult, BrpSystemSet,
+    RemoteRequest, SerializedRequestParams,
 };
 use anyhow::Result as AnyhowResult;
 use async_channel::{Receiver, Sender};
 use async_io::Async;
-use bevy_app::{App, Plugin, Startup};
-use bevy_ecs::system::{Res, Resource};
+use bevy_app::{App, Plugin, Startup, Update};
+use bevy_ecs::schedule::IntoSystemConfigs;
+use bevy_ecs::system::{Commands, Res, Resource};
 use bevy_tasks::{futures_lite::StreamExt, IoTaskPool};
 use core::net::{IpAddr, Ipv4Addr};
 use core::{
@@ -42,6 +44,8 @@ pub const DEFAULT_PORT: u16 = 15702;
 
 /// The default host address that Bevy will use for its server.
 pub const DEFAULT_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+
+const CHANNEL_SIZE: usize = 16;
 
 /// A struct that holds a collection of HTTP headers.
 ///
@@ -117,7 +121,8 @@ impl Plugin for RemoteHttpPlugin {
         app.insert_resource(HostAddress(self.address))
             .insert_resource(HostPort(self.port))
             .insert_resource(HostHeaders(self.headers.clone()))
-            .add_systems(Startup, start_http_server);
+            .add_systems(Startup, start_http_server)
+            .add_systems(Update, process_mailbox.before(BrpSystemSet::Deserialize));
     }
 }
 
@@ -187,22 +192,40 @@ pub struct HostAddress(pub IpAddr);
 pub struct HostPort(pub u16);
 
 /// A resource containing the headers that Bevy will include in its HTTP responses.
-///
 #[derive(Debug, Resource)]
 struct HostHeaders(pub Headers);
 
+/// A resource containing the receiver that the http server will send requests to become entities.
+#[derive(Debug, Resource)]
+struct HttpMailbox(Receiver<BrpMessage>);
+
+fn process_mailbox(mut commands: Commands, mailbox: Res<HttpMailbox>) {
+    while let Ok(message) = mailbox.0.try_recv() {
+        let mut entity = commands.spawn(RemoteRequest {
+            method: message.method,
+            sender: message.sender,
+        });
+        if let Some(params) = message.params {
+            entity.insert(SerializedRequestParams(params));
+        }
+    }
+}
+
 /// A system that starts up the Bevy Remote Protocol HTTP server.
 fn start_http_server(
-    request_sender: Res<BrpSender>,
+    mut commands: Commands,
     address: Res<HostAddress>,
     remote_port: Res<HostPort>,
     headers: Res<HostHeaders>,
 ) {
+    let (sender, receiver) = async_channel::bounded(CHANNEL_SIZE);
+    commands.insert_resource(HttpMailbox(receiver));
+
     IoTaskPool::get()
         .spawn(server_main(
             address.0,
             remote_port.0,
-            request_sender.clone(),
+            sender,
             headers.0.clone(),
         ))
         .detach();
