@@ -305,10 +305,10 @@ use bevy_app::prelude::*;
 use bevy_ecs::{
     component::Component,
     entity::Entity,
-    query::Has,
+    query::With,
     reflect::ReflectComponent,
     schedule::{IntoSystemConfigs, IntoSystemSetConfigs, SystemSet},
-    system::{Commands, In, IntoSystem, Query, SystemId, SystemInput},
+    system::{Commands, In, IntoSystem, Query, SystemId},
     world::World,
 };
 use bevy_reflect::Reflect;
@@ -327,50 +327,53 @@ pub mod http;
 pub struct RemotePlugin;
 impl Plugin for RemotePlugin {
     fn build(&self, app: &mut App) {
-        app.register_remote_handler(
-            builtin_methods::BRP_GET_METHOD,
-            builtin_methods::process_remote_get_request,
-        )
-        .register_remote_handler(
-            builtin_methods::BRP_QUERY_METHOD,
-            builtin_methods::process_remote_query_request,
-        )
-        .register_remote_handler(
-            builtin_methods::BRP_SPAWN_METHOD,
-            builtin_methods::process_remote_spawn_request,
-        )
-        .register_remote_handler(
-            builtin_methods::BRP_INSERT_METHOD,
-            builtin_methods::process_remote_insert_request,
-        )
-        .register_remote_handler(
-            builtin_methods::BRP_REMOVE_METHOD,
-            builtin_methods::process_remote_remove_request,
-        )
-        .register_remote_handler(
-            builtin_methods::BRP_DESTROY_METHOD,
-            builtin_methods::process_remote_destroy_request,
-        )
-        .register_remote_handler(
-            builtin_methods::BRP_REPARENT_METHOD,
-            builtin_methods::process_remote_reparent_request,
-        )
-        .register_remote_handler(
-            builtin_methods::BRP_LIST_METHOD,
-            builtin_methods::process_remote_list_request,
-        )
-        .register_remote_watching_handler(
-            builtin_methods::BRP_GET_AND_WATCH_METHOD,
-            builtin_methods::process_remote_get_watching_request,
-        )
-        .register_remote_watching_handler(
-            builtin_methods::BRP_LIST_AND_WATCH_METHOD,
-            builtin_methods::process_remote_list_watching_request,
-        );
+        app
+             .register_remote_handler(
+                 builtin_methods::BRP_GET_METHOD,
+                 builtin_methods::process_remote_get_request,
+             )
+            .register_remote_handler(
+                builtin_methods::BRP_QUERY_METHOD,
+                builtin_methods::process_remote_query_request,
+            )
+            .register_remote_handler(
+                builtin_methods::BRP_SPAWN_METHOD,
+                builtin_methods::process_remote_spawn_request,
+            )
+            .register_remote_handler(
+                builtin_methods::BRP_INSERT_METHOD,
+                builtin_methods::process_remote_insert_request,
+            )
+            .register_remote_handler(
+                builtin_methods::BRP_REMOVE_METHOD,
+                builtin_methods::process_remote_remove_request,
+            )
+            .register_remote_handler(
+                builtin_methods::BRP_DESTROY_METHOD,
+                builtin_methods::process_remote_destroy_request,
+            )
+            .register_remote_handler(
+                builtin_methods::BRP_REPARENT_METHOD,
+                builtin_methods::process_remote_reparent_request,
+            )
+            .register_remote_handler(
+                builtin_methods::BRP_LIST_METHOD,
+                builtin_methods::process_remote_list_request,
+            )
+           // .register_remote_watching_handler(
+           //     builtin_methods::BRP_GET_AND_WATCH_METHOD,
+           //     builtin_methods::process_remote_get_watching_request,
+           // )
+           // .register_remote_watching_handler(
+           //     builtin_methods::BRP_LIST_AND_WATCH_METHOD,
+           //     builtin_methods::process_remote_list_watching_request,
+           // )
+           ;
 
         app.configure_sets(
             Update,
             (
+                BrpSystemSet::FindHandler,
                 BrpSystemSet::Deserialize,
                 BrpSystemSet::Process,
                 BrpSystemSet::Cleanup,
@@ -385,6 +388,8 @@ impl Plugin for RemotePlugin {
 /// A system set for the order of BRP request processing.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BrpSystemSet {
+    /// The stage where the correct handler is found.
+    FindHandler,
     /// The deserialization stage.
     Deserialize,
     /// The processing stage where handlers are run.
@@ -432,7 +437,8 @@ impl RemoteAppExt for App {
         self.add_systems(
             Update,
             (
-                deserialize_request_params::<I>(name.clone()).in_set(BrpSystemSet::Deserialize),
+                add_method_handler::<I, O>.in_set(BrpSystemSet::FindHandler),
+                deserialize_request_params::<I, O>(name.clone()).in_set(BrpSystemSet::Deserialize),
                 process_remote_requests::<I, O>.in_set(BrpSystemSet::Process),
             ),
         );
@@ -459,7 +465,8 @@ impl RemoteAppExt for App {
         self.add_systems(
             Update,
             (
-                deserialize_request_params::<I>(name.clone()).in_set(BrpSystemSet::Deserialize),
+                add_method_handler::<I, O>.in_set(BrpSystemSet::FindHandler),
+                deserialize_request_params::<I, O>(name.clone()).in_set(BrpSystemSet::Deserialize),
                 process_remote_requests::<I, Option<O>>.in_set(BrpSystemSet::Process),
             ),
         );
@@ -484,7 +491,7 @@ pub struct RemoteHandlerMethod(String);
 /// The [`SystemId`] of a BRP handler's system.
 #[derive(Debug, Component, Reflect)]
 #[reflect(Component)]
-pub struct RemoteHandlerSystemId<I: SystemInput, O>(SystemId<I, O>);
+pub struct RemoteHandlerSystemId<I: 'static, O>(SystemId<In<I>, O>);
 
 /// A marker component for a handler that is for watching requests.
 #[derive(Debug, Component, Reflect)]
@@ -723,25 +730,64 @@ pub struct RequestParams<T>(T);
 #[derive(Debug, Component)]
 pub struct SerializedRequestParams(Value);
 
+/// A BRP request's handler's [`SystemId`].
+#[derive(Debug, Component)]
+pub struct RequestHandlerSystemId<I: 'static, O>(SystemId<In<Option<I>>, BrpResult<O>>);
+
 /// A marker component for a watching BRP request.
 #[derive(Debug, Component, Reflect)]
 #[reflect(Component)]
 pub struct WatchingRequest;
 
+/// A system that finds the handler for the requests method and adds it to the entity.
+fn add_method_handler<I: 'static, O: 'static>(
+    mut commands: Commands,
+    query: Query<(Entity, &RemoteRequest)>,
+    handler_query: Query<(
+        &RemoteHandlerMethod,
+        &RemoteHandlerSystemId<Option<I>, BrpResult<O>>,
+    )>,
+) {
+    for (entity, request) in &query {
+        let Some(handler) = handler_query
+            .iter()
+            .find(|(method, _)| method.0 == request.method)
+            .map(|(_, handler)| handler.0)
+        else {
+            let _ = request.sender.force_send(Err(BrpError {
+                code: error_codes::METHOD_NOT_FOUND,
+                message: format!("Method `{}` not found", request.method),
+                data: None,
+            }));
+            request.sender.close();
+            continue;
+        };
+        commands
+            .entity(entity)
+            .insert(RequestHandlerSystemId(handler));
+    }
+}
+
 /// Returns a new system that deserializes all request's [`SerializedRequestParams`] with
 /// the given method name into the given generic type. This value is added to the entity
 /// in [`RequestParams`].
-fn deserialize_request_params<T: DeserializeOwned + Send + Sync + 'static>(
+fn deserialize_request_params<I: DeserializeOwned + Send + Sync + 'static, O: 'static>(
     method: String,
-) -> impl Fn(Commands, Query<(Entity, &RemoteRequest, &mut SerializedRequestParams)>) {
+) -> impl Fn(
+    Commands,
+    Query<(Entity, &RemoteRequest, &mut SerializedRequestParams), With<RemoteHandlerSystemId<I, O>>>,
+) {
     move |mut commands: Commands,
-          mut query: Query<(Entity, &RemoteRequest, &mut SerializedRequestParams)>| {
+          mut query: Query<
+        (Entity, &RemoteRequest, &mut SerializedRequestParams),
+        With<RemoteHandlerSystemId<I, O>>,
+    >| {
         for (entity, request, mut params) in &mut query {
             if request.method != method {
                 continue;
             }
 
-            match serde_json::from_value::<T>(core::mem::take(&mut params.0)) {
+            match serde_json::from_value::<I>(core::mem::take(&mut params.0)) {
                 Ok(value) => {
                     commands.entity(entity).remove::<SerializedRequestParams>();
                     commands.entity(entity).insert(RequestParams(value));
@@ -766,40 +812,21 @@ fn process_remote_requests<
     mut commands: Commands,
     request_query: Query<(
         &RemoteRequest,
+        &RequestHandlerSystemId<I, O>,
         Option<&RequestParams<I>>,
-        Has<WatchingRequest>,
-    )>,
-    handler_query: Query<(
-        &RemoteHandlerMethod,
-        &RemoteHandlerSystemId<In<Option<I>>, BrpResult<O>>,
-        Has<RemoteWatchingHandler>,
     )>,
 ) {
-    for (request, params, is_watching) in &request_query {
+    for (request, system_id, params) in &request_query {
         if request.sender.is_closed() {
             continue;
         }
 
-        // Get the handler with it's method.
-        let Some(handler) = handler_query
-            .iter()
-            .find(|(method, _, _)| method.0 == request.method)
-            .map(|(_, handler, _)| handler.0)
-        else {
-            let _ = request.sender.force_send(Err(BrpError {
-                code: error_codes::METHOD_NOT_FOUND,
-                message: format!("Method `{}` not found", request.method),
-                data: None,
-            }));
-            request.sender.close();
-            continue;
-        };
-
         let sender = request.sender.clone();
         let input = params.map(|v| v.0.clone());
+        let system_id = system_id.0;
 
         commands.queue(move |world: &mut World| {
-            let result = match world.run_system_with_input(handler, input) {
+            let result = match world.run_system_with_input(system_id, input) {
                 Ok(result) => result,
                 Err(error) => Err(BrpError {
                     code: error_codes::INTERNAL_ERROR,
@@ -813,7 +840,7 @@ fn process_remote_requests<
             };
             let err = result.is_err();
             let _ = sender.force_send(result);
-            if err || is_watching {
+            if err {
                 // No point keeping channel open if method is bad.
                 sender.close();
             }

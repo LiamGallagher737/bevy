@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
-        .add_plugins(RemotePlugin::default())
+        .add_plugins(RemotePlugin)
         .add_plugins(RemoteHttpPlugin::default())
         .add_systems(Startup, setup)
         .add_systems(Update, remove.run_if(input_just_pressed(KeyCode::Space)))

@@ -330,12 +330,22 @@ fn parse_some<T: for<'de> Deserialize<'de>>(value: Option<Value>) -> Result<T, B
 }
 
 /// Handles a `bevy/get` request coming from a client.
-pub fn process_remote_get_request(In(params): In<Option<Value>>, world: &World) -> BrpResult {
-    let BrpGetParams {
+pub fn process_remote_get_request(
+    In(params): In<Option<BrpGetParams>>,
+    world: &World,
+) -> BrpResult<BrpGetResponse> {
+    let Some(BrpGetParams {
         entity,
         components,
         strict,
-    } = parse_some(params)?;
+    }) = params
+    else {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Params are required".to_string(),
+            data: None,
+        });
+    };
 
     let app_type_registry = world.resource::<AppTypeRegistry>();
     let type_registry = app_type_registry.read();
@@ -343,7 +353,7 @@ pub fn process_remote_get_request(In(params): In<Option<Value>>, world: &World) 
 
     let response =
         reflect_components_to_response(components, strict, entity, entity_ref, &type_registry)?;
-    serde_json::to_value(response).map_err(BrpError::internal)
+    Ok(response)
 }
 
 /// Handles a `bevy/get+watch` request coming from a client.
@@ -519,15 +529,25 @@ fn reflect_component(
 }
 
 /// Handles a `bevy/query` request coming from a client.
-pub fn process_remote_query_request(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
-    let BrpQueryParams {
+pub fn process_remote_query_request(
+    In(params): In<Option<BrpQueryParams>>,
+    world: &mut World,
+) -> BrpResult<Vec<BrpQueryRow>> {
+    let Some(BrpQueryParams {
         data: BrpQuery {
             components,
             option,
             has,
         },
         filter: BrpQueryFilter { without, with },
-    } = parse_some(params)?;
+    }) = params
+    else {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Params are required".to_string(),
+            data: None,
+        });
+    };
 
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
@@ -604,12 +624,21 @@ pub fn process_remote_query_request(In(params): In<Option<Value>>, world: &mut W
         });
     }
 
-    serde_json::to_value(response).map_err(BrpError::internal)
+    Ok(response)
 }
 
 /// Handles a `bevy/spawn` request coming from a client.
-pub fn process_remote_spawn_request(In(params): In<Option<Value>>, world: &mut World) -> BrpResult {
-    let BrpSpawnParams { components } = parse_some(params)?;
+pub fn process_remote_spawn_request(
+    In(params): In<Option<BrpSpawnParams>>,
+    world: &mut World,
+) -> BrpResult<BrpSpawnResponse> {
+    let Some(BrpSpawnParams { components }) = params else {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Params are required".to_string(),
+            data: None,
+        });
+    };
 
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
@@ -623,15 +652,21 @@ pub fn process_remote_spawn_request(In(params): In<Option<Value>>, world: &mut W
         .map_err(BrpError::component_error)?;
 
     let response = BrpSpawnResponse { entity: entity_id };
-    serde_json::to_value(response).map_err(BrpError::internal)
+    Ok(response)
 }
 
 /// Handles a `bevy/insert` request (insert components) coming from a client.
 pub fn process_remote_insert_request(
-    In(params): In<Option<Value>>,
+    In(params): In<Option<BrpInsertParams>>,
     world: &mut World,
-) -> BrpResult {
-    let BrpInsertParams { entity, components } = parse_some(params)?;
+) -> BrpResult<()> {
+    let Some(BrpInsertParams { entity, components }) = params else {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Params are required".to_string(),
+            data: None,
+        });
+    };
 
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
@@ -646,15 +681,21 @@ pub fn process_remote_insert_request(
     )
     .map_err(BrpError::component_error)?;
 
-    Ok(Value::Null)
+    Ok(())
 }
 
 /// Handles a `bevy/remove` request (remove components) coming from a client.
 pub fn process_remote_remove_request(
-    In(params): In<Option<Value>>,
+    In(params): In<Option<BrpRemoveParams>>,
     world: &mut World,
-) -> BrpResult {
-    let BrpRemoveParams { entity, components } = parse_some(params)?;
+) -> BrpResult<()> {
+    let Some(BrpRemoveParams { entity, components }) = params else {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Params are required".to_string(),
+            data: None,
+        });
+    };
 
     let app_type_registry = world.resource::<AppTypeRegistry>().clone();
     let type_registry = app_type_registry.read();
@@ -668,19 +709,25 @@ pub fn process_remote_remove_request(
         entity_world_mut.remove_by_id(component_id);
     }
 
-    Ok(Value::Null)
+    Ok(())
 }
 
 /// Handles a `bevy/destroy` (despawn entity) request coming from a client.
 pub fn process_remote_destroy_request(
-    In(params): In<Option<Value>>,
+    In(params): In<Option<BrpDestroyParams>>,
     world: &mut World,
-) -> BrpResult {
-    let BrpDestroyParams { entity } = parse_some(params)?;
+) -> BrpResult<()> {
+    let Some(BrpDestroyParams { entity }) = params else {
+        return Err(BrpError {
+            code: error_codes::INVALID_PARAMS,
+            message: "Params are required".to_string(),
+            data: None,
+        });
+    };
 
     get_entity_mut(world, entity)?.despawn();
 
-    Ok(Value::Null)
+    Ok(())
 }
 
 /// Handles a `bevy/reparent` request coming from a client.
