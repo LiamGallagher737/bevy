@@ -269,10 +269,10 @@
 //!     App::new()
 //!         .add_plugins(DefaultPlugins)
 //!         .add_plugins(
-//!             // `default` adds all of the built-in methods, while `with_method` extends them
+//!             // `default` adds all of the built-in methods, while `register_remote_handler` extends them
 //!             RemotePlugin::default()
-//!                 .with_method("super_user/cool_method", path::to::my::cool::handler)
-//!                 // ... more methods can be added by chaining `with_method`
+//!                 .register_remote_handler("super_user/cool_method", path::to::my::cool::handler)
+//!                 // ... more methods can be added by chaining `register_remote_handler`
 //!         )
 //!         .add_systems(
 //!             // ... standard application setup
@@ -304,15 +304,17 @@ use async_channel::{Receiver, Sender};
 use bevy_app::prelude::*;
 use bevy_derive::{Deref, DerefMut};
 use bevy_ecs::{
+    component::Component,
     entity::Entity,
+    reflect::ReflectComponent,
     schedule::IntoSystemConfigs,
-    system::{Commands, In, IntoSystem, ResMut, Resource, System, SystemId},
+    system::{Commands, In, IntoSystem, Query, ResMut, Resource, System, SystemId, SystemInput},
     world::World,
 };
+use bevy_reflect::Reflect;
 use bevy_utils::{prelude::default, HashMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::RwLock;
 
 pub mod builtin_methods;
 pub mod http;
@@ -325,121 +327,54 @@ const CHANNEL_SIZE: usize = 16;
 /// the available protocols and its default methods.
 ///
 /// [crate-level documentation]: crate
-pub struct RemotePlugin {
-    /// The verbs that the server will recognize and respond to.
-    methods: RwLock<Vec<(String, RemoteMethodHandler)>>,
-}
-
-impl RemotePlugin {
-    /// Create a [`RemotePlugin`] with the default address and port but without
-    /// any associated methods.
-    fn empty() -> Self {
-        Self {
-            methods: RwLock::new(vec![]),
-        }
-    }
-
-    /// Add a remote method to the plugin using the given `name` and `handler`.
-    #[must_use]
-    pub fn with_method<M>(
-        mut self,
-        name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult, M>,
-    ) -> Self {
-        self.methods.get_mut().unwrap().push((
-            name.into(),
-            RemoteMethodHandler::Instant(Box::new(IntoSystem::into_system(handler))),
-        ));
-        self
-    }
-
-    /// Add a remote method with a watching handler to the plugin using the given `name`.
-    #[must_use]
-    pub fn with_watching_method<M>(
-        mut self,
-        name: impl Into<String>,
-        handler: impl IntoSystem<In<Option<Value>>, BrpResult<Option<Value>>, M>,
-    ) -> Self {
-        self.methods.get_mut().unwrap().push((
-            name.into(),
-            RemoteMethodHandler::Watching(Box::new(IntoSystem::into_system(handler))),
-        ));
-        self
-    }
-}
-
-impl Default for RemotePlugin {
-    fn default() -> Self {
-        Self::empty()
-            .with_method(
-                builtin_methods::BRP_GET_METHOD,
-                builtin_methods::process_remote_get_request,
-            )
-            .with_method(
-                builtin_methods::BRP_QUERY_METHOD,
-                builtin_methods::process_remote_query_request,
-            )
-            .with_method(
-                builtin_methods::BRP_SPAWN_METHOD,
-                builtin_methods::process_remote_spawn_request,
-            )
-            .with_method(
-                builtin_methods::BRP_INSERT_METHOD,
-                builtin_methods::process_remote_insert_request,
-            )
-            .with_method(
-                builtin_methods::BRP_REMOVE_METHOD,
-                builtin_methods::process_remote_remove_request,
-            )
-            .with_method(
-                builtin_methods::BRP_DESTROY_METHOD,
-                builtin_methods::process_remote_destroy_request,
-            )
-            .with_method(
-                builtin_methods::BRP_REPARENT_METHOD,
-                builtin_methods::process_remote_reparent_request,
-            )
-            .with_method(
-                builtin_methods::BRP_LIST_METHOD,
-                builtin_methods::process_remote_list_request,
-            )
-            .with_watching_method(
-                builtin_methods::BRP_GET_AND_WATCH_METHOD,
-                builtin_methods::process_remote_get_watching_request,
-            )
-            .with_watching_method(
-                builtin_methods::BRP_LIST_AND_WATCH_METHOD,
-                builtin_methods::process_remote_list_watching_request,
-            )
-    }
-}
-
+pub struct RemotePlugin;
 impl Plugin for RemotePlugin {
     fn build(&self, app: &mut App) {
-        let mut remote_methods = RemoteMethods::new();
+        app.register_remote_handler(
+            builtin_methods::BRP_GET_METHOD,
+            builtin_methods::process_remote_get_request,
+        )
+        .register_remote_handler(
+            builtin_methods::BRP_QUERY_METHOD,
+            builtin_methods::process_remote_query_request,
+        )
+        .register_remote_handler(
+            builtin_methods::BRP_SPAWN_METHOD,
+            builtin_methods::process_remote_spawn_request,
+        )
+        .register_remote_handler(
+            builtin_methods::BRP_INSERT_METHOD,
+            builtin_methods::process_remote_insert_request,
+        )
+        .register_remote_handler(
+            builtin_methods::BRP_REMOVE_METHOD,
+            builtin_methods::process_remote_remove_request,
+        )
+        .register_remote_handler(
+            builtin_methods::BRP_DESTROY_METHOD,
+            builtin_methods::process_remote_destroy_request,
+        )
+        .register_remote_handler(
+            builtin_methods::BRP_REPARENT_METHOD,
+            builtin_methods::process_remote_reparent_request,
+        )
+        .register_remote_handler(
+            builtin_methods::BRP_LIST_METHOD,
+            builtin_methods::process_remote_list_request,
+        )
+        .register_remote_watching_handler(
+            builtin_methods::BRP_GET_AND_WATCH_METHOD,
+            builtin_methods::process_remote_get_watching_request,
+        )
+        .register_remote_watching_handler(
+            builtin_methods::BRP_LIST_AND_WATCH_METHOD,
+            builtin_methods::process_remote_list_watching_request,
+        );
 
-        let plugin_methods = &mut *self.methods.write().unwrap();
-        for (name, handler) in plugin_methods.drain(..) {
-            remote_methods.insert(
-                name,
-                match handler {
-                    RemoteMethodHandler::Instant(system) => RemoteMethodSystemId::Instant(
-                        app.main_mut().world_mut().register_boxed_system(system),
-                    ),
-                    RemoteMethodHandler::Watching(system) => RemoteMethodSystemId::Watching(
-                        app.main_mut().world_mut().register_boxed_system(system),
-                    ),
-                },
-            );
-        }
-
-        app.insert_resource(remote_methods)
-            .init_resource::<RemoteWatchingRequests>()
-            .add_systems(PreStartup, setup_mailbox_channel)
+        app.add_systems(PreStartup, setup_mailbox_channel)
             .add_systems(
                 Update,
                 (
-                    process_remote_requests,
                     process_ongoing_watching_requests,
                     remove_closed_watching_requests,
                 )
@@ -447,6 +382,58 @@ impl Plugin for RemotePlugin {
             );
     }
 }
+
+/// An extention trait for [`App`] providing the methods for registering remote handlers.
+pub trait RemoteAppExt {
+    /// Register a new BRP handler.
+    fn register_remote_handler<I: Clone + Send + Sync + 'static, O: Send + Sync + 'static, M>(
+        &mut self,
+        name: impl Into<String>,
+        handler: impl IntoSystem<In<Option<I>>, BrpResult<O>, M>,
+    ) -> &mut Self;
+
+    /// Register a new watching BRP handler.
+    fn register_remote_watching_handler<
+        I: Clone + Send + Sync + 'static,
+        O: Send + Sync + 'static,
+        M,
+    >(
+        &mut self,
+        name: impl Into<String>,
+        handler: impl IntoSystem<In<Option<I>>, BrpResult<Option<O>>, M>,
+    ) -> &mut Self {
+        self.register_remote_handler(name, handler);
+        self
+    }
+}
+
+impl RemoteAppExt for App {
+    fn register_remote_handler<I: Clone + Send + Sync + 'static, O: Send + Sync + 'static, M>(
+        &mut self,
+        name: impl Into<String>,
+        handler: impl IntoSystem<In<Option<I>>, BrpResult<O>, M>,
+    ) -> &mut Self {
+        self.add_systems(Update, process_remote_requests::<I, O>);
+        let id = self
+            .main_mut()
+            .world_mut()
+            .register_boxed_system(Box::new(IntoSystem::into_system(handler)));
+        self.main_mut()
+            .world_mut()
+            .spawn((RemoteHandlerMethod(name.into()), RemoteHandlerSystemId(id)));
+        self
+    }
+}
+
+/// The method name of a BRP handler. Bevy's builtin methods follow the `bevy/*` format.
+#[derive(Debug, Component, Reflect)]
+#[reflect(Component)]
+pub struct RemoteHandlerMethod(String);
+
+/// The [`SystemId`] of a BRP handler's system.
+#[derive(Debug, Component, Reflect)]
+#[reflect(Component)]
+pub struct RemoteHandlerSystemId<I: SystemInput, O>(SystemId<I, O>);
 
 /// A type to hold the allowed types of systems to be used as method handlers.
 #[derive(Debug)]
@@ -751,96 +738,60 @@ fn setup_mailbox_channel(mut commands: Commands) {
     commands.insert_resource(BrpReceiver(request_receiver));
 }
 
-/// A system that receives requests placed in the [`BrpReceiver`] and processes
-/// them, using the [`RemoteMethods`] resource to map each request to its handler.
+/// The data for a BRP request.
+#[derive(Debug, Component)]
+pub struct RemoteRequest<O> {
+    /// The method to invoked by this request.
+    pub method: String,
+    /// The sender for this request's channel.
+    pub sender: Sender<BrpResult<O>>,
+}
+
+/// The params of a BRP request.
 ///
-/// This needs exclusive access to the [`World`] because clients can manipulate
-/// anything in the ECS.
-fn process_remote_requests(world: &mut World) {
-    if !world.contains_resource::<BrpReceiver>() {
-        return;
-    }
+/// If no params were supplied this component should be ommited.
+#[derive(Debug, Component)]
+pub struct RemoteRequestParams<T>(T);
 
-    while let Ok(message) = world.resource_mut::<BrpReceiver>().try_recv() {
-        // Fetch the handler for the method. If there's no such handler
-        // registered, return an error.
-        let Some(&handler) = world.resource::<RemoteMethods>().get(&message.method) else {
-            let _ = message.sender.force_send(Err(BrpError {
-                code: error_codes::METHOD_NOT_FOUND,
-                message: format!("Method `{}` not found", message.method),
-                data: None,
-            }));
-            return;
+fn process_remote_requests<I: Clone + Send + Sync + 'static, O: Send + 'static>(
+    mut commands: Commands,
+    request_query: Query<(&RemoteRequest<O>, Option<&RemoteRequestParams<I>>)>,
+    handler_query: Query<(
+        &RemoteHandlerMethod,
+        &RemoteHandlerSystemId<In<Option<I>>, BrpResult<O>>,
+    )>,
+) {
+    for (request, params) in &request_query {
+        let Some(handler) = handler_query
+            .iter()
+            .find(|(method, _)| method.0 == request.method)
+            .map(|(_, handler)| handler.0.clone())
+        else {
+            continue;
         };
-
-        match handler {
-            RemoteMethodSystemId::Instant(id) => {
-                let result = match world.run_system_with_input(id, message.params) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let _ = message.sender.force_send(Err(BrpError {
-                            code: error_codes::INTERNAL_ERROR,
-                            message: format!("Failed to run method handler: {error}"),
-                            data: None,
-                        }));
-                        continue;
-                    }
-                };
-
-                let _ = message.sender.force_send(result);
-            }
-            RemoteMethodSystemId::Watching(id) => {
-                world
-                    .resource_mut::<RemoteWatchingRequests>()
-                    .0
-                    .push((message, id));
-            }
-        }
-    }
-}
-
-/// A system that checks all ongoing watching requests for changes that should be sent
-/// and handles it if so.
-fn process_ongoing_watching_requests(world: &mut World) {
-    world.resource_scope::<RemoteWatchingRequests, ()>(|world, requests| {
-        for (message, system_id) in requests.0.iter() {
-            let handler_result = process_single_ongoing_watching_request(world, message, system_id);
-            let sender_result = match handler_result {
-                Ok(Some(value)) => message.sender.try_send(Ok(value)),
-                Err(err) => message.sender.try_send(Err(err)),
-                Ok(None) => continue,
+        let sender = request.sender.clone();
+        let input = params.map(|b| b.0.to_owned());
+        commands.queue(move |world: &mut World| {
+            let result = match world.run_system_with_input(handler, input) {
+                Ok(result) => result,
+                Err(error) => Err(BrpError {
+                    code: error_codes::INTERNAL_ERROR,
+                    message: format!("Failed to run method handler: {error}"),
+                    data: None,
+                }),
             };
-
-            if sender_result.is_err() {
-                // The [`remove_closed_watching_requests`] system will clean this up.
-                message.sender.close();
-            }
-        }
-    });
+            let _ = sender.force_send(result);
+        });
+    }
 }
 
-fn process_single_ongoing_watching_request(
-    world: &mut World,
-    message: &BrpMessage,
-    system_id: &RemoteWatchingMethodSystemId,
-) -> BrpResult<Option<Value>> {
-    world
-        .run_system_with_input(*system_id, message.params.clone())
-        .map_err(|error| BrpError {
-            code: error_codes::INTERNAL_ERROR,
-            message: format!("Failed to run method handler: {error}"),
-            data: None,
-        })?
-}
-
-fn remove_closed_watching_requests(mut requests: ResMut<RemoteWatchingRequests>) {
-    for i in (0..requests.0.len()).rev() {
-        let Some((message, _)) = requests.0.get(i) else {
-            unreachable!()
-        };
-
-        if message.sender.is_closed() {
-            requests.0.swap_remove(i);
+fn remove_closed_watching_requests<O: Send + 'static>(
+    mut commands: Commands,
+    query: Query<(Entity, &RemoteRequest<O>)>,
+) {
+    for (entity, request) in &query {
+        if request.sender.is_closed() {
+            commands.entity(entity).despawn();
         }
     }
 }
